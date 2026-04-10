@@ -45,7 +45,7 @@ CONDA_SETUP  := source /home/hsb/miniforge3/etc/profile.d/conda.sh && \
 PY310_ROS_ENV := PYTHON_EXECUTABLE=$(CONDA_PYTHON) \
                  PYTHONPATH=$(CONDA_PKGS):$$PYTHONPATH
 
-.PHONY: all piper robot keyboard record stop list help setup-can check-tmux
+.PHONY: all piper robot keyboard record stop list migrate viz help setup-can check-tmux
 
 # ==============================================================================
 #  一键启动（tmux）
@@ -190,6 +190,30 @@ TOPIC_RECORD := /record_cmd
 TOPIC_CTRL   := /arm/control_cmd
 
 # ==============================================================================
+#  迁移旧格式数据集 → lerobot v3 格式
+# ==============================================================================
+
+migrate:
+	@echo "[INFO] 迁移数据集: $(SAVE_ROOT)"
+	@bash -c "$(CONDA_SETUP) && \
+	          cd $(REPO_DIR) && \
+	          $(CONDA_PYTHON) migrate_dataset.py --root '$(SAVE_ROOT)'"
+
+# 可视化验证（需要安装 lerobot + rerun）
+# REPO_ID 用于标识，不需要是 HuggingFace 上的实际仓库
+VIZ_REPO_ID ?= local/piper
+VIZ_EPISODE ?= 0
+
+viz:
+	@echo "[INFO] 可视化 episode $(VIZ_EPISODE) from $(SAVE_ROOT)"
+	@bash -c "$(CONDA_SETUP) && \
+	          lerobot-dataset-viz \
+	            --repo-id      '$(VIZ_REPO_ID)' \
+	            --root         '$(SAVE_ROOT)' \
+	            --episode-index $(VIZ_EPISODE) \
+	            --tolerance-s  0.05"
+
+# ==============================================================================
 #  查看已录制数据
 # ==============================================================================
 
@@ -205,12 +229,19 @@ list:
 		  print('  总任务数  :', d.get('total_tasks',0)); \
 		  print('  FPS       :', d.get('fps',0))"; \
 	fi
-	@if [ -f "$(SAVE_ROOT)/meta/tasks.jsonl" ]; then \
+	@if [ -f "$(SAVE_ROOT)/meta/tasks.parquet" ]; then \
 		echo "--- 任务列表 ---"; \
+		bash -c "$(CONDA_SETUP) && $(CONDA_PYTHON) -c \
+		  \"import pandas as pd; print(pd.read_parquet('$(SAVE_ROOT)/meta/tasks.parquet').to_string())\""; \
+	elif [ -f "$(SAVE_ROOT)/meta/tasks.jsonl" ]; then \
+		echo "--- 任务列表 (旧格式) ---"; \
 		cat "$(SAVE_ROOT)/meta/tasks.jsonl"; \
 	fi
-	@if [ -f "$(SAVE_ROOT)/meta/episodes.jsonl" ]; then \
-		echo "--- episodes (最近 10 条) ---"; \
+	@if [ -d "$(SAVE_ROOT)/meta/episodes" ]; then \
+		echo "--- episodes parquet 目录 ---"; \
+		ls "$(SAVE_ROOT)/meta/episodes/chunk-000/" 2>/dev/null || true; \
+	elif [ -f "$(SAVE_ROOT)/meta/episodes.jsonl" ]; then \
+		echo "--- episodes (最近 10 条, 旧格式) ---"; \
 		tail -n 10 "$(SAVE_ROOT)/meta/episodes.jsonl"; \
 	fi
 	@echo ""
@@ -233,6 +264,8 @@ help:
 	@echo "  make record     启动数据采集器         (Process C, py310)"
 	@echo "  make stop       停止所有节点"
 	@echo "  make list       查看已录制的数据集信息"
+	@echo "  make migrate    迁移旧格式数据集到 lerobot v3 格式"
+	@echo "  make viz        可视化数据集（需要 rerun）"
 	@echo ""
 	@echo "可配置变量:"
 	@echo "  SAVE_ROOT  数据集保存根目录  (当前: $(SAVE_ROOT))"

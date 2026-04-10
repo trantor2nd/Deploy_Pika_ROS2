@@ -44,6 +44,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import pandas as pd
 
 # pyarrow 用于写 Parquet
 import pyarrow as pa
@@ -62,7 +63,9 @@ from config import (
     FISHEYE_INDEX, FISHEYE_WIDTH, FISHEYE_HEIGHT, FISHEYE_FPS,
     REALSENSE_SN, REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS,
     CAPTURE_HZ, DEFAULT_SAVE_ROOT, DEFAULT_TASK, HOME_POS,
-    TOPIC_JOINT_STATES, TOPIC_GRIPPER_STATE, TOPIC_RECORD_CMD,
+    TOPIC_JOINT_STATES, TOPIC_JOINT_CMD,
+    TOPIC_GRIPPER_STATE, TOPIC_GRIPPER_CMD,
+    TOPIC_RECORD_CMD,
     EPISODES_PER_CHUNK,
 )
 
@@ -144,37 +147,55 @@ class LeRobotDatasetWriter:
 
     def _video_path(self, episode_index: int, cam: str) -> Path:
         chunk = self._chunk_dir(episode_index)
-        path  = self.root / "videos" / f"chunk-{chunk:03d}" / \
-                f"observation.images.{cam}"
+        # lerobot v3 期望: videos/{video_key}/chunk-{n:03d}/episode_{ep:06d}.mp4
+        path = self.root / "videos" / f"observation.images.{cam}" / f"chunk-{chunk:03d}"
         path.mkdir(parents=True, exist_ok=True)
         return path / f"episode_{episode_index:06d}.mp4"
 
     # ------------------------------------------------------------------ #
 
     def _load_meta(self) -> None:
-        """读取已有的 episodes / tasks，以便追加录制。"""
-        eps_file   = self.root / "meta" / "episodes.jsonl"
-        tasks_file = self.root / "meta" / "tasks.jsonl"
+        """读取已有的 episodes / tasks，以便追加录制。
+        优先读取 lerobot v3 Parquet 格式，回退到旧 JSONL 格式。
+        """
+        eps_dir      = self.root / "meta" / "episodes"
+        tasks_pq     = self.root / "meta" / "tasks.parquet"
+        eps_jsonl    = self.root / "meta" / "episodes.jsonl"
+        tasks_jsonl  = self.root / "meta" / "tasks.jsonl"
 
+        # --- Episodes ---
         self.episodes: list[dict] = []
-        if eps_file.exists():
-            with open(eps_file) as f:
+        if eps_dir.exists():
+            for pq_file in sorted(eps_dir.glob("*/*.parquet")):
+                df = pd.read_parquet(pq_file)
+                for _, row in df.iterrows():
+                    ep = row.to_dict()
+                    if "tasks" in ep and not isinstance(ep["tasks"], list):
+                        ep["tasks"] = list(ep["tasks"])
+                    self.episodes.append(ep)
+        elif eps_jsonl.exists():
+            with open(eps_jsonl) as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         self.episodes.append(json.loads(line))
 
+        # --- Tasks ---
         self.tasks_map: dict[str, int] = {}  # task_text -> task_index
-        if tasks_file.exists():
-            with open(tasks_file) as f:
+        if tasks_pq.exists():
+            df = pd.read_parquet(tasks_pq)
+            for task_text, row in df.iterrows():
+                self.tasks_map[task_text] = int(row["task_index"])
+        elif tasks_jsonl.exists():
+            with open(tasks_jsonl) as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         obj = json.loads(line)
                         self.tasks_map[obj["task"]] = obj["task_index"]
 
-        self.total_frames        = sum(ep.get("length", 0) for ep in self.episodes)
-        self.next_episode_index  = len(self.episodes)
+        self.total_frames       = sum(int(ep.get("length", 0)) for ep in self.episodes)
+        self.next_episode_index = len(self.episodes)
 
         logger.info(
             "数据集加载完成: %d episodes, %d frames",
@@ -227,8 +248,9 @@ class LeRobotDatasetWriter:
 
     def _write_parquet(self, ep: "EpisodeWriter", ep_idx: int,
                        task_idx: int) -> None:
-        n = ep.frame_count
-        states  = np.stack(ep.states, axis=0)       # (N, 7)
+        n      = ep.frame_count
+        states  = np.stack(ep.states,  axis=0)   # (N, 7): 实际关节+夹爪
+        actions = np.stack(ep.actions, axis=0)   # (N, 7): 指令关节+夹爪
         timestamps = ep.timestamps
 
         schema = pa.schema([
@@ -243,8 +265,8 @@ class LeRobotDatasetWriter:
 
         table = pa.table(
             {
-                "observation.state": [states[i].tolist() for i in range(n)],
-                "action":            [states[i].tolist() for i in range(n)],
+                "observation.state": [states[i].tolist()  for i in range(n)],
+                "action":            [actions[i].tolist() for i in range(n)],
                 "timestamp":         [float(t) for t in timestamps],
                 "frame_index":       list(range(n)),
                 "episode_index":     [ep_idx] * n,
@@ -258,20 +280,58 @@ class LeRobotDatasetWriter:
     # ------------------------------------------------------------------ #
 
     def _write_meta(self) -> None:
-        # episodes.jsonl
-        with open(self.root / "meta" / "episodes.jsonl", "w") as f:
+        # --- meta/tasks.parquet (lerobot v3 格式) ---
+        tasks_df = pd.DataFrame(
+            {"task_index": list(self.tasks_map.values())},
+            index=pd.Index(list(self.tasks_map.keys()), name="task"),
+        )
+        tasks_df.to_parquet(self.root / "meta" / "tasks.parquet")
+
+        # --- meta/episodes/chunk-000/file-000.parquet (lerobot v3 格式) ---
+        if self.episodes:
+            eps_dir = self.root / "meta" / "episodes" / "chunk-000"
+            eps_dir.mkdir(parents=True, exist_ok=True)
+
+            ep_records = []
             for ep in self.episodes:
-                f.write(json.dumps(ep, ensure_ascii=False) + "\n")
+                ep_idx = int(ep["episode_index"])
+                chunk  = self._chunk_dir(ep_idx)
+                record: dict = {
+                    "episode_index":    ep_idx,
+                    "tasks":            list(ep.get("tasks", [])),
+                    "length":           int(ep.get("length", 0)),
+                    "data/chunk_index": chunk,
+                    "data/file_index":  ep_idx,
+                }
+                for cam in self.active_cameras:
+                    vid_key = f"observation.images.{cam}"
+                    record[f"videos/{vid_key}/chunk_index"]    = chunk
+                    record[f"videos/{vid_key}/file_index"]     = ep_idx
+                    # 每个 episode 独立 MP4，起始时间戳始终为 0
+                    record[f"videos/{vid_key}/from_timestamp"] = 0.0
+                ep_records.append(record)
 
-        # tasks.jsonl
-        with open(self.root / "meta" / "tasks.jsonl", "w") as f:
-            for task_text, task_idx in self.tasks_map.items():
-                f.write(json.dumps(
-                    {"task_index": task_idx, "task": task_text},
-                    ensure_ascii=False,
-                ) + "\n")
+            # 构建 PyArrow 表（明确指定 schema 确保类型正确）
+            schema_fields = [
+                pa.field("episode_index",    pa.int64()),
+                pa.field("tasks",            pa.list_(pa.string())),
+                pa.field("length",           pa.int64()),
+                pa.field("data/chunk_index", pa.int64()),
+                pa.field("data/file_index",  pa.int64()),
+            ]
+            for cam in self.active_cameras:
+                vid_key = f"observation.images.{cam}"
+                schema_fields += [
+                    pa.field(f"videos/{vid_key}/chunk_index",    pa.int64()),
+                    pa.field(f"videos/{vid_key}/file_index",     pa.int64()),
+                    pa.field(f"videos/{vid_key}/from_timestamp", pa.float64()),
+                ]
+            table = pa.Table.from_pylist(ep_records, schema=pa.schema(schema_fields))
+            pq.write_table(table, eps_dir / "file-000.parquet")
 
-        # info.json
+        # --- meta/info.json ---
+        # DEFAULT_FEATURES 必须写入 features，否则 lerobot 的 get_hf_features_from_features
+        # 无法在 Dataset.from_parquet 时匹配 parquet 中的 timestamp/frame_index 等列
         features: dict = {
             "observation.state": {
                 "dtype": "float32",
@@ -283,6 +343,11 @@ class LeRobotDatasetWriter:
                 "shape": [self.STATE_DIM],
                 "names": self.STATE_NAMES,
             },
+            "timestamp":     {"dtype": "float32", "shape": [1], "names": None},
+            "frame_index":   {"dtype": "int64",   "shape": [1], "names": None},
+            "episode_index": {"dtype": "int64",   "shape": [1], "names": None},
+            "index":         {"dtype": "int64",   "shape": [1], "names": None},
+            "task_index":    {"dtype": "int64",   "shape": [1], "names": None},
         }
         for cam in self.active_cameras:
             h, w, _ = self.CAMERA_SHAPES[cam]
@@ -299,16 +364,20 @@ class LeRobotDatasetWriter:
             }
 
         info = {
-            "codebase_version": "v3.0",
-            "robot_type":       "piper",
-            "fps":              self.fps,
-            "features":         features,
-            "total_episodes":   len(self.episodes),
-            "total_frames":     self.total_frames,
-            "total_tasks":      len(self.tasks_map),
-            "splits":           {"train": f"0:{len(self.episodes)}"},
-            "data_path":        "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-            "video_path":       "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+            "codebase_version":      "v3.0",
+            "robot_type":            "piper",
+            "fps":                   self.fps,
+            "features":              features,
+            "total_episodes":        len(self.episodes),
+            "total_frames":          self.total_frames,
+            "total_tasks":           len(self.tasks_map),
+            "chunks_size":           EPISODES_PER_CHUNK,
+            "data_files_size_in_mb": 100,
+            "video_files_size_in_mb": 200,
+            "splits":                {"train": f"0:{len(self.episodes)}"},
+            # 使用 chunk_index / file_index 作为格式参数（与 lerobot v3 兼容）
+            "data_path":  "data/chunk-{chunk_index:03d}/episode_{file_index:06d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/episode_{file_index:06d}.mp4",
         }
         with open(self.root / "meta" / "info.json", "w") as f:
             json.dump(info, f, indent=2, ensure_ascii=False)
@@ -329,7 +398,8 @@ class EpisodeWriter:
         self.start_time    = time.time()
 
         # 状态缓冲
-        self.states:     list[np.ndarray] = []
+        self.states:     list[np.ndarray] = []   # observation.state（实际位置）
+        self.actions:    list[np.ndarray] = []   # action（键盘指令位置）
         self.timestamps: list[float]      = []
 
         # 视频写入器：每个活跃相机一个
@@ -354,13 +424,22 @@ class EpisodeWriter:
         self,
         joints:          list[float],
         gripper:         float,
+        joint_cmd:       list[float],
+        gripper_cmd:     float,
         fisheye_frame:   Optional[np.ndarray] = None,
         realsense_frame: Optional[np.ndarray] = None,
     ) -> None:
-        """写入一帧数据。"""
-        t = time.time() - self.start_time
-        state = np.array(list(joints[:6]) + [gripper], dtype=np.float32)
+        """写入一帧数据。
+        joints/gripper   → observation.state（来自 piper_single_ctrl 的实际反馈）
+        joint_cmd/gripper_cmd → action（来自键盘控制器的指令值）
+        """
+        # 使用帧对齐时间戳（frame_index / fps），与 cv2.VideoWriter 编码帧严格对齐
+        # 避免 lerobot 读取时因 wall-clock 偏差超出 tolerance_s 导致解码失败
+        t = self.frame_count / self.parent.fps
+        state  = np.array(list(joints[:6])    + [gripper],     dtype=np.float32)
+        action = np.array(list(joint_cmd[:6]) + [gripper_cmd], dtype=np.float32)
         self.states.append(state)
+        self.actions.append(action)
         self.timestamps.append(t)
 
         frames_map = {
@@ -422,15 +501,28 @@ class DataRecorder(Node):
             JointState, TOPIC_JOINT_STATES, self._joint_cb, 10
         )
         self.create_subscription(
+            JointState, TOPIC_JOINT_CMD, self._joint_cmd_cb, 10
+        )
+        self.create_subscription(
             Float64, TOPIC_GRIPPER_STATE, self._gripper_cb, 10
+        )
+        self.create_subscription(
+            Float64, TOPIC_GRIPPER_CMD, self._gripper_cmd_cb, 10
         )
         self.create_subscription(
             String, TOPIC_RECORD_CMD, self._cmd_cb, 10
         )
 
         # 本地状态缓存
+        # joint_state:     实际关节位置（来自 piper_single_ctrl → /joint_states_single）
+        # joint_cmd:       键盘指令位置（来自 Process B → /arm/joint_cmd），用作 action
         self.joint_state:    list[float] = list(HOME_POS)
+        self.joint_cmd:      list[float] = list(HOME_POS)
         self.gripper_actual: float       = 0.0
+        self.gripper_cmd:    float       = 0.0
+        # 标记是否收到过真实的关节状态反馈（CAN → piper_single_ctrl → /joint_states_single）
+        # 若从未收到，采集时用 joint_cmd 代替 joint_state（指令位置近似实际位置）
+        self._joint_state_received: bool = False
         self.recording:      bool        = False
         self.running:        bool        = True
         self.current_episode: Optional[EpisodeWriter] = None
@@ -514,11 +606,23 @@ class DataRecorder(Node):
     # ------------------------------------------------------------------ #
 
     def _joint_cb(self, msg: JointState) -> None:
+        """实际关节位置反馈（来自 piper_single_ctrl）→ observation.state"""
         if len(msg.position) >= 6:
             self.joint_state = list(msg.position[:6])
+            self._joint_state_received = True
+
+    def _joint_cmd_cb(self, msg: JointState) -> None:
+        """键盘发出的关节指令（来自 Process B）→ action"""
+        if len(msg.position) >= 6:
+            self.joint_cmd = list(msg.position[:6])
 
     def _gripper_cb(self, msg: Float64) -> None:
+        """实际夹爪位置反馈 → observation.state[6]"""
         self.gripper_actual = msg.data
+
+    def _gripper_cmd_cb(self, msg: Float64) -> None:
+        """键盘发出的夹爪指令 → action[6]"""
+        self.gripper_cmd = msg.data
 
     def _cmd_cb(self, msg: String) -> None:
         cmd = msg.data.lower().strip()
@@ -536,6 +640,11 @@ class DataRecorder(Node):
     # ------------------------------------------------------------------ #
 
     def _start_recording(self) -> None:
+        if not self._joint_state_received:
+            self.get_logger().warning(
+                "⚠️  未收到 /joint_states_single（piper_single_ctrl 未运行？），"
+                "observation.state 将使用指令位置代替实际位置"
+            )
         self.current_episode = self.writer.create_episode(self.task)
         self.recording       = True
 
@@ -578,9 +687,15 @@ class DataRecorder(Node):
                         except Exception as cam_exc:
                             logger.warning("RealSense 获取帧失败: %s", cam_exc)
 
+                    # 若 piper_single_ctrl 未运行/CAN 无反馈，用指令位置代替实际位置
+                    obs_joints  = self.joint_state if self._joint_state_received \
+                                  else self.joint_cmd
+                    obs_gripper = self.gripper_actual
                     ep.add_frame(
-                        joints=self.joint_state,
-                        gripper=self.gripper_actual,
+                        joints=obs_joints,
+                        gripper=obs_gripper,
+                        joint_cmd=self.joint_cmd,
+                        gripper_cmd=self.gripper_cmd,
                         fisheye_frame=fisheye_frame,
                         realsense_frame=realsense_frame,
                     )

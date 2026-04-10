@@ -88,7 +88,7 @@ class KeyboardController(Node):
         self.key_map: dict[str, tuple[int, float]] = {
             "a": (0, +s / 2.0),  "d": (0, -s / 2.0),
             "w": (1, +s / 1.25), "s": (1, -s / 1.25),
-            "u": (2, +s / 1.25), "j": (2, -s / 1.25),
+            "u": (2, -s / 1.25), "j": (2, +s / 1.25),
             "r": (3, +s),        "f": (3, -s),
             "t": (4, +s),        "g": (4, -s),
             "e": (5, +s),        "q": (5, -s),
