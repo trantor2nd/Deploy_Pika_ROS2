@@ -52,5 +52,10 @@ TOPIC_GRIPPER_STATE = "/gripper_state"      # Process A -> C: Float64 (实际夹
 TOPIC_JOINT_CTRL   = "/joint_ctrl_single"   # Process A -> piper: JointState (控制指令)
 TOPIC_ENABLE_FLAG  = "/enable_flag"         # Process A -> piper: Bool (使能/失能)
 
+# ===== 遥操作模式 ROS2 话题 =====
+TELEOP_TOPIC_ACTION      = "/joint_states_gripper"                     # sensor → piper: 遥操作指令 (7 DOF)
+TELEOP_FISHEYE_TOPIC     = "/gripper/camera_fisheye/color/image_raw"   # sensor_msgs/Image bgr8
+TELEOP_REALSENSE_TOPIC   = "/gripper/camera/color/image_raw"           # sensor_msgs/Image rgb8
+
 # ===== LeRobot 数据集 =====
 EPISODES_PER_CHUNK = 1000   # 每个 chunk 存放的最大 episode 数

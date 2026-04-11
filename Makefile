@@ -45,7 +45,7 @@ CONDA_SETUP  := source /home/hsb/miniforge3/etc/profile.d/conda.sh && \
 PY310_ROS_ENV := PYTHON_EXECUTABLE=$(CONDA_PYTHON) \
                  PYTHONPATH=$(CONDA_PKGS):$$PYTHONPATH
 
-.PHONY: all piper robot keyboard record stop list migrate viz help setup-can check-tmux
+.PHONY: all piper robot keyboard record stop list migrate viz help setup-can check-tmux teleop record-teleop
 
 # ==============================================================================
 #  一键启动（tmux）
@@ -165,6 +165,51 @@ record:
 	            --fps       $(FPS)"
 
 # ==============================================================================
+#  遥操作数据采集（需先手动启动 teleop: terminal1.sh + terminal2.sh）
+# ==============================================================================
+
+teleop: check-tmux
+	@tmux kill-session -t pika_teleop 2>/dev/null || true
+	@echo "[INFO] 遥操作采集模式"
+	@echo "[INFO]   保存路径 : $(SAVE_ROOT)"
+	@echo "[INFO]   任务指令 : $(TASK)"
+	@echo "[INFO]   采集帧率 : $(FPS) Hz"
+	@tmux new-session -d -s pika_teleop
+	@tmux split-window -h -t pika_teleop:0.0
+	@tmux select-layout -t pika_teleop even-horizontal
+	@tmux set-option -t pika_teleop mouse on
+	@# pane 0.0 = recorder (teleop mode), pane 0.1 = keyboard (for o/p)
+	@tmux send-keys -t pika_teleop:0.0 \
+		"cd $(REPO_DIR) && $(MAKE) record-teleop SAVE_ROOT='$(SAVE_ROOT)' TASK='$(TASK)' FPS=$(FPS)" Enter
+	@tmux send-keys -t pika_teleop:0.1 \
+		"sleep 3 && cd $(REPO_DIR) && $(MAKE) keyboard" Enter
+	@echo ""
+	@echo "  遥操作采集已就绪:"
+	@echo "  ┌──────────────────┬──────────────────┐"
+	@echo "  │ 0.0  recorder    │ 0.1  keyboard    │"
+	@echo "  └──────────────────┴──────────────────┘"
+	@echo "  停止: make stop   键盘窗口按 o/p 控制采集"
+	@echo ""
+	@if [ -z "$$TMUX" ]; then \
+		tmux attach-session -t pika_teleop; \
+	else \
+		tmux switch-client -t pika_teleop; \
+	fi
+
+record-teleop:
+	@echo "[INFO] 启动数据采集器 (遥操作模式)"
+	@echo "[INFO]   保存路径 : $(SAVE_ROOT)"
+	@echo "[INFO]   任务指令 : $(TASK)"
+	@echo "[INFO]   采集帧率 : $(FPS) Hz"
+	@bash -c "$(CONDA_SETUP) && $(ROS_SETUP) && \
+	          cd $(REPO_DIR) && \
+	          $(PY310_ROS_ENV) $(CONDA_PYTHON) data_recorder.py \
+	            --save-root '$(SAVE_ROOT)' \
+	            --task      '$(TASK)' \
+	            --fps       $(FPS) \
+	            --mode      teleop"
+
+# ==============================================================================
 #  停止所有节点
 # ==============================================================================
 
@@ -184,6 +229,7 @@ stop:
 	@pkill -9 -f "keyboard_controller.py"       2>/dev/null || true
 	@pkill -9 -f "data_recorder.py"             2>/dev/null || true
 	@tmux kill-session -t pika_ros              2>/dev/null || true
+	@tmux kill-session -t pika_teleop           2>/dev/null || true
 	@echo "[INFO] 所有节点已停止 ✅"
 
 TOPIC_RECORD := /record_cmd
@@ -258,6 +304,7 @@ help:
 	@echo ""
 	@echo "目标:"
 	@echo "  make all        在 tmux 中一键启动所有进程（需要 tmux）"
+	@echo "  make teleop     遥操作采集模式（需先启动 teleop 脚本）"
 	@echo "  make piper      启动 piper_single_ctrl 控制节点"
 	@echo "  make robot      启动机械臂控制器      (Process A, py310)"
 	@echo "  make keyboard   启动键盘控制器         (Process B, 系统Python3)"
@@ -278,7 +325,13 @@ help:
 	@echo "示例:"
 	@echo "  make record TASK='抓取红色方块' SAVE_ROOT=/data/dataset"
 	@echo "  make all    TASK='pick_cube'    SAVE_ROOT=/data/dataset"
+	@echo "  make teleop TASK='teleop_task'  SAVE_ROOT=/data/dataset"
 	@echo "  make list   SAVE_ROOT=/data/dataset"
+	@echo ""
+	@echo "遥操作采集流程:"
+	@echo "  1. bash /home/data/Project/Deploy/teleoperate/terminal1.sh"
+	@echo "  2. bash /home/data/Project/Deploy/teleoperate/terminal2.sh"
+	@echo "  3. make teleop TASK='task_name' SAVE_ROOT=/data/dataset"
 	@echo ""
 
 # ==============================================================================

@@ -52,11 +52,8 @@ import pyarrow.parquet as pq
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Image
 from std_msgs.msg import Float64, String
-
-from pika.camera.fisheye import FisheyeCamera
-from pika.camera.realsense import RealSenseCamera
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
@@ -66,6 +63,7 @@ from config import (
     TOPIC_JOINT_STATES, TOPIC_JOINT_CMD,
     TOPIC_GRIPPER_STATE, TOPIC_GRIPPER_CMD,
     TOPIC_RECORD_CMD,
+    TELEOP_TOPIC_ACTION, TELEOP_FISHEYE_TOPIC, TELEOP_REALSENSE_TOPIC,
     EPISODES_PER_CHUNK,
 )
 
@@ -92,7 +90,33 @@ def parse_args() -> argparse.Namespace:
         "--fps", type=float, default=CAPTURE_HZ,
         help=f"采集帧率 Hz（默认: {CAPTURE_HZ}）",
     )
+    parser.add_argument(
+        "--mode", type=str, choices=["keyboard", "teleop"], default="keyboard",
+        help="采集模式: keyboard=键盘直控（默认）, teleop=遥操作",
+    )
     return parser.parse_args()
+
+
+def _ros_image_to_bgr(msg: Image) -> np.ndarray:
+    """Convert sensor_msgs/Image to BGR numpy array without cv_bridge."""
+    if msg.encoding == "bgr8":
+        return np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3
+        ).copy()
+    elif msg.encoding == "rgb8":
+        return np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3
+        )[:, :, ::-1].copy()
+    elif msg.encoding == "bgra8":
+        return np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 4
+        )[:, :, :3].copy()
+    elif msg.encoding == "rgba8":
+        return np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 4
+        )[:, :, 2::-1].copy()
+    else:
+        raise ValueError(f"Unsupported image encoding: {msg.encoding}")
 
 
 # ====================================================================== #
@@ -470,21 +494,30 @@ class DataRecorder(Node):
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("data_recorder")
-        logging.getLogger("pika.serial_comm").setLevel(logging.ERROR)
-        logging.getLogger("pika.camera.realsense").setLevel(logging.ERROR)
 
         self.fps  = args.fps
         self.task = args.task
+        self.teleop_mode = (args.mode == "teleop")
 
-        # 连接相机，确定可用相机列表
+        # ---- 相机初始化（模式相关）----
         self.fisheye   = None
         self.realsense = None
-        self._connect_cameras()
-        active_cameras = []
-        if self.fisheye:
-            active_cameras.append("fisheye_rgb")
-        if self.realsense:
-            active_cameras.append("realsense_rgb")
+        # 遥操作模式：通过 ROS2 Image 话题获取图像
+        self._teleop_fisheye_frame:   Optional[np.ndarray] = None
+        self._teleop_realsense_frame: Optional[np.ndarray] = None
+
+        if self.teleop_mode:
+            active_cameras = self._init_teleop_cameras()
+        else:
+            logging.getLogger("pika.serial_comm").setLevel(logging.ERROR)
+            logging.getLogger("pika.camera.realsense").setLevel(logging.ERROR)
+            self._connect_cameras()
+            active_cameras = []
+            if self.fisheye:
+                active_cameras.append("fisheye_rgb")
+            if self.realsense:
+                active_cameras.append("realsense_rgb")
+
         if not active_cameras:
             self.get_logger().warning("未连接任何相机，将只记录关节/夹爪状态")
 
@@ -496,26 +529,35 @@ class DataRecorder(Node):
             active_cameras=active_cameras,
         )
 
-        # ROS2 订阅
+        # ---- ROS2 订阅（共用）----
         self.create_subscription(
             JointState, TOPIC_JOINT_STATES, self._joint_cb, 10
-        )
-        self.create_subscription(
-            JointState, TOPIC_JOINT_CMD, self._joint_cmd_cb, 10
-        )
-        self.create_subscription(
-            Float64, TOPIC_GRIPPER_STATE, self._gripper_cb, 10
-        )
-        self.create_subscription(
-            Float64, TOPIC_GRIPPER_CMD, self._gripper_cmd_cb, 10
         )
         self.create_subscription(
             String, TOPIC_RECORD_CMD, self._cmd_cb, 10
         )
 
+        # ---- ROS2 订阅（模式相关）----
+        if self.teleop_mode:
+            # 遥操作：action 来自 /joint_states_gripper (arm+gripper 指令)
+            self.create_subscription(
+                JointState, TELEOP_TOPIC_ACTION, self._teleop_action_cb, 10
+            )
+        else:
+            # 键盘：action 来自 Process B 的 /arm/joint_cmd + /arm/gripper_cmd
+            self.create_subscription(
+                JointState, TOPIC_JOINT_CMD, self._joint_cmd_cb, 10
+            )
+            self.create_subscription(
+                Float64, TOPIC_GRIPPER_STATE, self._gripper_cb, 10
+            )
+            self.create_subscription(
+                Float64, TOPIC_GRIPPER_CMD, self._gripper_cmd_cb, 10
+            )
+
         # 本地状态缓存
         # joint_state:     实际关节位置（来自 piper_single_ctrl → /joint_states_single）
-        # joint_cmd:       键盘指令位置（来自 Process B → /arm/joint_cmd），用作 action
+        # joint_cmd:       指令位置 — 键盘模式来自 /arm/joint_cmd，遥操作来自 /joint_states_gripper
         self.joint_state:    list[float] = list(HOME_POS)
         self.joint_cmd:      list[float] = list(HOME_POS)
         self.gripper_actual: float       = 0.0
@@ -536,8 +578,9 @@ class DataRecorder(Node):
         )
         self._capture_thread.start()
 
+        mode_str = "遥操作" if self.teleop_mode else "键盘"
         self.get_logger().info(
-            f"DataRecorder 节点启动 ✅  save_root={args.save_root}  task={args.task}"
+            f"DataRecorder 节点启动 ✅  mode={mode_str}  save_root={args.save_root}  task={args.task}"
         )
 
     # ------------------------------------------------------------------ #
@@ -545,6 +588,10 @@ class DataRecorder(Node):
     # ------------------------------------------------------------------ #
 
     def _connect_cameras(self) -> None:
+        """键盘模式: 通过 Pika SDK 直接打开相机。"""
+        from pika.camera.fisheye import FisheyeCamera
+        from pika.camera.realsense import RealSenseCamera
+
         # 鱼眼相机
         try:
             cam = FisheyeCamera(
@@ -589,6 +636,37 @@ class DataRecorder(Node):
         except Exception as exc:
             self.get_logger().warning(f"RealSense 相机异常: {exc}")
 
+    def _init_teleop_cameras(self) -> list[str]:
+        """遥操作模式：订阅 ROS2 Image 话题获取相机图像。"""
+        active_cameras = []
+        self.create_subscription(
+            Image, TELEOP_FISHEYE_TOPIC, self._teleop_fisheye_cb, 10
+        )
+        active_cameras.append("fisheye_rgb")
+        self.get_logger().info(
+            f"遥操作模式: 订阅鱼眼话题 {TELEOP_FISHEYE_TOPIC}"
+        )
+        self.create_subscription(
+            Image, TELEOP_REALSENSE_TOPIC, self._teleop_realsense_cb, 10
+        )
+        active_cameras.append("realsense_rgb")
+        self.get_logger().info(
+            f"遥操作模式: 订阅 RealSense 话题 {TELEOP_REALSENSE_TOPIC}"
+        )
+        return active_cameras
+
+    def _teleop_fisheye_cb(self, msg: Image) -> None:
+        try:
+            self._teleop_fisheye_frame = _ros_image_to_bgr(msg)
+        except Exception as exc:
+            logger.warning("鱼眼图像转换失败: %s", exc)
+
+    def _teleop_realsense_cb(self, msg: Image) -> None:
+        try:
+            self._teleop_realsense_frame = _ros_image_to_bgr(msg)
+        except Exception as exc:
+            logger.warning("RealSense 图像转换失败: %s", exc)
+
     def _disconnect_cameras(self) -> None:
         if self.fisheye:
             try:
@@ -610,6 +688,16 @@ class DataRecorder(Node):
         if len(msg.position) >= 6:
             self.joint_state = list(msg.position[:6])
             self._joint_state_received = True
+            # 遥操作模式：夹爪状态也从 /joint_states_single position[6] 获取（CAN 反馈）
+            if self.teleop_mode and len(msg.position) >= 7:
+                self.gripper_actual = float(msg.position[6])
+
+    def _teleop_action_cb(self, msg: JointState) -> None:
+        """遥操作模式: 来自 /joint_states_gripper 的 arm+gripper 指令 → action"""
+        if len(msg.position) >= 6:
+            self.joint_cmd = list(msg.position[:6])
+        if len(msg.position) >= 7:
+            self.gripper_cmd = float(msg.position[6])
 
     def _joint_cmd_cb(self, msg: JointState) -> None:
         """键盘发出的关节指令（来自 Process B）→ action"""
@@ -668,24 +756,28 @@ class DataRecorder(Node):
             try:
                 ep = self.current_episode
                 if self.recording and ep is not None:
-                    # 获取相机帧（单独 try，避免相机异常杀死整个线程）
-                    fisheye_frame = None
-                    if self.fisheye:
-                        try:
-                            ok, frame = self.fisheye.get_frame()
-                            if ok and frame is not None:
-                                fisheye_frame = frame
-                        except Exception as cam_exc:
-                            logger.warning("鱼眼相机获取帧失败: %s", cam_exc)
+                    # 获取相机帧
+                    if self.teleop_mode:
+                        fisheye_frame   = self._teleop_fisheye_frame
+                        realsense_frame = self._teleop_realsense_frame
+                    else:
+                        fisheye_frame = None
+                        if self.fisheye:
+                            try:
+                                ok, frame = self.fisheye.get_frame()
+                                if ok and frame is not None:
+                                    fisheye_frame = frame
+                            except Exception as cam_exc:
+                                logger.warning("鱼眼相机获取帧失败: %s", cam_exc)
 
-                    realsense_frame = None
-                    if self.realsense:
-                        try:
-                            ok, frame = self.realsense.get_color_frame()
-                            if ok and frame is not None:
-                                realsense_frame = frame
-                        except Exception as cam_exc:
-                            logger.warning("RealSense 获取帧失败: %s", cam_exc)
+                        realsense_frame = None
+                        if self.realsense:
+                            try:
+                                ok, frame = self.realsense.get_color_frame()
+                                if ok and frame is not None:
+                                    realsense_frame = frame
+                            except Exception as cam_exc:
+                                logger.warning("RealSense 获取帧失败: %s", cam_exc)
 
                     # 若 piper_single_ctrl 未运行/CAN 无反馈，用指令位置代替实际位置
                     obs_joints  = self.joint_state if self._joint_state_received \
@@ -703,7 +795,8 @@ class DataRecorder(Node):
                 logger.error("采集循环异常（已跳过本帧）: %s", exc, exc_info=True)
             time.sleep(interval)
 
-        self._disconnect_cameras()
+        if not self.teleop_mode:
+            self._disconnect_cameras()
         logger.info("采集线程已安全退出 ✅")
 
 
