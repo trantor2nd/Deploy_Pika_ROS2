@@ -60,6 +60,7 @@ from config import (
     FISHEYE_INDEX, FISHEYE_WIDTH, FISHEYE_HEIGHT, FISHEYE_FPS,
     REALSENSE_SN, REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS,
     CAPTURE_HZ, DEFAULT_SAVE_ROOT, DEFAULT_TASK, HOME_POS,
+    GRIPPER_MAX,
     TOPIC_JOINT_STATES, TOPIC_JOINT_CMD,
     TOPIC_GRIPPER_STATE, TOPIC_GRIPPER_CMD,
     TOPIC_RECORD_CMD,
@@ -688,16 +689,21 @@ class DataRecorder(Node):
         if len(msg.position) >= 6:
             self.joint_state = list(msg.position[:6])
             self._joint_state_received = True
-            # 遥操作模式：夹爪状态也从 /joint_states_single position[6] 获取（CAN 反馈）
-            if self.teleop_mode and len(msg.position) >= 7:
-                self.gripper_actual = float(msg.position[6])
+            # 遥操作模式：夹爪状态从 _teleop_action_cb 获取（传感器实测距离 mm）
+            # /joint_states_single position[6] 是 CAN 弧度值，不可直接转 mm
 
     def _teleop_action_cb(self, msg: JointState) -> None:
-        """遥操作模式: 来自 /joint_states_gripper 的 arm+gripper 指令 → action"""
+        """遥操作模式: 来自 /joint_states_gripper 的 arm+gripper 指令 → action
+        position[6] 是传感器实测夹爪距离（米），乘以 1000 转 mm 与键盘模式一致。
+        同时用于 observation.state 的夹爪值（同一传感器，同一物理量）。
+        """
         if len(msg.position) >= 6:
             self.joint_cmd = list(msg.position[:6])
         if len(msg.position) >= 7:
-            self.gripper_cmd = float(msg.position[6])
+            # 传感器 distance 单位为米，乘以 1000 转 mm（张开距离，与键盘模式一致）
+            gripper_mm = float(msg.position[6]) * 1000.0
+            self.gripper_cmd = gripper_mm
+            self.gripper_actual = gripper_mm
 
     def _joint_cmd_cb(self, msg: JointState) -> None:
         """键盘发出的关节指令（来自 Process B）→ action"""
