@@ -16,7 +16,7 @@ Process B: 键盘控制器
     j3: u / j       j4: r / f
     j5: t / g       j6: e / q
   夹爪: h (张开) / k (闭合)
-  采集: o (开始) / p (停止)
+  采集: o (开始) / p (停止) / l (丢弃)
   复位: z
   使能: n  失能: m
   退出: 空格 (安全退出)
@@ -195,6 +195,14 @@ class KeyboardController(Node):
                 self.recording = False
                 print("[REC] ■ 停止采集")
             return
+        if key in ("l", "L"):
+            self.pub_record.publish(String(data="discard"))
+            if self.recording:
+                self.recording = False
+                print("[REC] ✗ 丢弃当前录制中的 episode")
+            else:
+                print("[REC] ✗ 丢弃上一条已完成的 episode")
+            return
 
         # ----- 夹爪 -----
         if key in ("h", "H"):
@@ -239,7 +247,7 @@ class KeyboardController(Node):
         print("  j1: a / d     j2: w / s     j3: u / j")
         print("  j4: r / f     j5: t / g     j6: e / q")
         print("夹爪:  h (张开) / k (闭合)")
-        print("采集:  o (开始) / p (停止)")
+        print("采集:  o (开始) / p (停止) / l (丢弃)")
         print("机械臂: z (回HOME) | n (使能) | m (失能)")
         print("退出:  空格  [安全退出: 先回HOME再失能]")
         print("=" * 60, flush=True)

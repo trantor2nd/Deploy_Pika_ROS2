@@ -19,7 +19,7 @@ All shared constants (topic names, joint limits, device paths, defaults) live in
 
 ## Key Data Flow
 
-### Keyboard mode (`make all`)
+### Keyboard mode (`make control`)
 ```
 Process B (keyboard) --joint_cmd/gripper_cmd--> Process A (robot) --joint_ctrl--> Process 0 (piper CAN)
 Process B --record_cmd--> Process C (recorder)
@@ -38,7 +38,7 @@ Teleop sensors --> ROS2 Image topics --> Process C (camera frames)
 Process B (keyboard, for o/p only) --record_cmd--> Process C
 ```
 
-Do NOT run `make all` and teleop simultaneously — they conflict on piper_single_ctrl and camera devices.
+Do NOT run `make control` and teleop simultaneously — they conflict on piper_single_ctrl and camera devices.
 
 `observation.state` = actual positions from hardware feedback. `action` = command positions (keyboard or teleop).
 
@@ -46,7 +46,7 @@ Do NOT run `make all` and teleop simultaneously — they conflict on piper_singl
 
 ```bash
 # Keyboard mode: start everything in tmux (2x2 pane layout)
-make all TASK="task_name" SAVE_ROOT=/path/to/dataset
+make control TASK="task_name" SAVE_ROOT=/path/to/dataset
 
 # Teleop mode: start recorder + keyboard only (teleop scripts must be running first)
 make teleop TASK="task_name" SAVE_ROOT=/path/to/dataset

@@ -3,13 +3,13 @@
 # ==============================================================================
 #
 # 快速上手:
-#   make all                      # 在 tmux 中启动所有进程
+#   make control                   # 键盘模式：在 tmux 中启动所有进程
 #   make keyboard                 # 单独启动键盘控制器 (Process B)
 #   make record                   # 单独启动数据采集器 (Process C)
 #
 # 指定路径与任务:
 #   make record TASK="抓取红色方块" SAVE_ROOT=/data/mydata
-#   make all    TASK="pick_block"  SAVE_ROOT=/data/mydata
+#   make control TASK="pick_block"  SAVE_ROOT=/data/mydata
 #
 # 停止所有:
 #   make stop
@@ -45,13 +45,13 @@ CONDA_SETUP  := source /home/hsb/miniforge3/etc/profile.d/conda.sh && \
 PY310_ROS_ENV := PYTHON_EXECUTABLE=$(CONDA_PYTHON) \
                  PYTHONPATH=$(CONDA_PKGS):$$PYTHONPATH
 
-.PHONY: all piper robot keyboard record stop list migrate viz help setup-can check-tmux teleop record-teleop
+.PHONY: control piper robot keyboard record stop list migrate viz help setup-can check-tmux teleop record-teleop calibrate test-camera
 
 # ==============================================================================
-#  一键启动（tmux）
+#  键盘模式一键启动（tmux）
 # ==============================================================================
 
-all: check-tmux
+control: check-tmux
 	@# ── 第一步：在当前终端完成 CAN 初始化（sudo 在此输入，不会藏进 tmux）──
 	$(MAKE) setup-can
 	@# ── 第二步：创建 2×2 分屏，各进程错峰自动启动 ──
@@ -142,7 +142,7 @@ robot:
 keyboard:
 	@echo "[INFO] 启动键盘控制器 (Process B) ..."
 	@echo "[INFO] 键位: a/d w/s u/j r/f t/g e/q (关节) | h/k (夹爪)"
-	@echo "[INFO]       o/p (采集) | z (回HOME) | 空格 (安全退出)"
+	@echo "[INFO]       o/p (采集) | l (丢弃) | z (回HOME) | 空格 (安全退出)"
 	@bash -c "$(ROS_SETUP) && \
 	          cd $(REPO_DIR) && \
 	          python3 keyboard_controller.py"
@@ -170,25 +170,33 @@ record:
 
 teleop: check-tmux
 	@tmux kill-session -t pika_teleop 2>/dev/null || true
-	@echo "[INFO] 遥操作采集模式"
+	@echo "[INFO] 遥操作采集模式（自动启动全部节点）"
 	@echo "[INFO]   保存路径 : $(SAVE_ROOT)"
 	@echo "[INFO]   任务指令 : $(TASK)"
 	@echo "[INFO]   采集帧率 : $(FPS) Hz"
 	@tmux new-session -d -s pika_teleop
 	@tmux split-window -h -t pika_teleop:0.0
-	@tmux select-layout -t pika_teleop even-horizontal
+	@tmux split-window -v -t pika_teleop:0.0
+	@tmux split-window -v -t pika_teleop:0.1
+	@tmux select-layout -t pika_teleop tiled
 	@tmux set-option -t pika_teleop mouse on
-	@# pane 0.0 = recorder (teleop mode), pane 0.1 = keyboard (for o/p)
+	@# pane 0.0=CAN+sensor  0.1=FK/IK/teleop  0.2=recorder  0.3=keyboard
 	@tmux send-keys -t pika_teleop:0.0 \
-		"cd $(REPO_DIR) && $(MAKE) record-teleop SAVE_ROOT='$(SAVE_ROOT)' TASK='$(TASK)' FPS=$(FPS)" Enter
+		"cd $(REPO_DIR) && PIPER_WS=$(PIPER_WS) CAN_PORT=$(CAN_PORT) bash teleop_terminal1.sh" Enter
 	@tmux send-keys -t pika_teleop:0.1 \
-		"sleep 3 && cd $(REPO_DIR) && $(MAKE) keyboard" Enter
+		"sleep 10 && cd $(REPO_DIR) && PIPER_WS=$(PIPER_WS) CONDA_PYTHON=$(CONDA_PYTHON) CONDA_PKGS=$(CONDA_PKGS) bash teleop_terminal2.sh" Enter
+	@tmux send-keys -t pika_teleop:0.2 \
+		"sleep 15 && cd $(REPO_DIR) && $(MAKE) record-teleop SAVE_ROOT='$(SAVE_ROOT)' TASK='$(TASK)' FPS=$(FPS)" Enter
+	@tmux send-keys -t pika_teleop:0.3 \
+		"sleep 20 && cd $(REPO_DIR) && $(MAKE) keyboard" Enter
 	@echo ""
-	@echo "  遥操作采集已就绪:"
+	@echo "  遥操作采集已就绪 (4 窗格):"
 	@echo "  ┌──────────────────┬──────────────────┐"
-	@echo "  │ 0.0  recorder    │ 0.1  keyboard    │"
+	@echo "  │ 0.0  CAN+sensor  │ 0.1  FK/IK/teleop│"
+	@echo "  ├──────────────────┼──────────────────┤"
+	@echo "  │ 0.2  recorder    │ 0.3  keyboard    │"
 	@echo "  └──────────────────┴──────────────────┘"
-	@echo "  停止: make stop   键盘窗口按 o/p 控制采集"
+	@echo "  停止: make stop   键盘窗口按 o/p/l 控制采集"
 	@echo ""
 	@if [ -z "$$TMUX" ]; then \
 		tmux attach-session -t pika_teleop; \
@@ -210,6 +218,24 @@ record-teleop:
 	            --mode      teleop"
 
 # ==============================================================================
+#  测试相机
+# ==============================================================================
+
+test-camera:
+	@echo "[INFO] 测试鱼眼 + RealSense 相机（按 q 退出, 按 s 保存截图）"
+	@bash -c "$(CONDA_SETUP) && \
+	          cd $(REPO_DIR) && \
+	          $(CONDA_PYTHON) test_camera.py"
+
+# ==============================================================================
+#  标定（libsurvive VR 追踪设备）
+# ==============================================================================
+
+calibrate:
+	@echo "[INFO] 启动 libsurvive 标定 ..."
+	@bash $(REPO_DIR)/calibrate.sh
+
+# ==============================================================================
 #  停止所有节点
 # ==============================================================================
 
@@ -223,11 +249,16 @@ stop:
 	@pkill -SIGTERM -f "robot_controller.py"    2>/dev/null || true
 	@pkill -SIGTERM -f "keyboard_controller.py" 2>/dev/null || true
 	@pkill -SIGTERM -f "data_recorder.py"       2>/dev/null || true
+	@pkill -SIGTERM -f "teleop_rand_single_piper" 2>/dev/null || true
+	@pkill -SIGTERM -f "start_sensor_gripper"   2>/dev/null || true
 	@sleep 2
 	@pkill -9 -f "piper_single_ctrl"            2>/dev/null || true
 	@pkill -9 -f "robot_controller.py"          2>/dev/null || true
 	@pkill -9 -f "keyboard_controller.py"       2>/dev/null || true
 	@pkill -9 -f "data_recorder.py"             2>/dev/null || true
+	@pkill -9 -f "teleop_rand_single_piper"     2>/dev/null || true
+	@pkill -9 -f "start_sensor_gripper"         2>/dev/null || true
+	@pkill -9 -f "pika_remote_piper"            2>/dev/null || true
 	@tmux kill-session -t pika_ros              2>/dev/null || true
 	@tmux kill-session -t pika_teleop           2>/dev/null || true
 	@echo "[INFO] 所有节点已停止 ✅"
@@ -303,16 +334,18 @@ help:
 	@echo "Pika ROS2 Piper 控制与数据采集系统"
 	@echo ""
 	@echo "目标:"
-	@echo "  make all        在 tmux 中一键启动所有进程（需要 tmux）"
-	@echo "  make teleop     遥操作采集模式（需先启动 teleop 脚本）"
-	@echo "  make piper      启动 piper_single_ctrl 控制节点"
-	@echo "  make robot      启动机械臂控制器      (Process A, py310)"
-	@echo "  make keyboard   启动键盘控制器         (Process B, 系统Python3)"
-	@echo "  make record     启动数据采集器         (Process C, py310)"
-	@echo "  make stop       停止所有节点"
-	@echo "  make list       查看已录制的数据集信息"
-	@echo "  make migrate    迁移旧格式数据集到 lerobot v3 格式"
-	@echo "  make viz        可视化数据集（需要 rerun）"
+	@echo "  make control      键盘模式：tmux 一键启动所有进程"
+	@echo "  make teleop       遥操作模式：自动启动全部节点"
+	@echo "  make test-camera  测试鱼眼 + RealSense 相机"
+	@echo "  make calibrate    运行 libsurvive 标定"
+	@echo "  make piper        启动 piper_single_ctrl 控制节点"
+	@echo "  make robot        启动机械臂控制器      (Process A, py310)"
+	@echo "  make keyboard     启动键盘控制器         (Process B, 系统Python3)"
+	@echo "  make record       启动数据采集器         (Process C, py310)"
+	@echo "  make stop         停止所有节点"
+	@echo "  make list         查看已录制的数据集信息"
+	@echo "  make migrate      迁移旧格式数据集到 lerobot v3 格式"
+	@echo "  make viz          可视化数据集（需要 rerun）"
 	@echo ""
 	@echo "可配置变量:"
 	@echo "  SAVE_ROOT  数据集保存根目录  (当前: $(SAVE_ROOT))"
@@ -323,15 +356,14 @@ help:
 	@echo "  PIPER_WS   piper_ros 路径    (当前: $(PIPER_WS))"
 	@echo ""
 	@echo "示例:"
-	@echo "  make record TASK='抓取红色方块' SAVE_ROOT=/data/dataset"
-	@echo "  make all    TASK='pick_cube'    SAVE_ROOT=/data/dataset"
-	@echo "  make teleop TASK='teleop_task'  SAVE_ROOT=/data/dataset"
+	@echo "  make record  TASK='抓取红色方块' SAVE_ROOT=/data/dataset"
+	@echo "  make control TASK='pick_cube'   SAVE_ROOT=/data/dataset"
+	@echo "  make teleop  TASK='teleop_task' SAVE_ROOT=/data/dataset"
 	@echo "  make list   SAVE_ROOT=/data/dataset"
 	@echo ""
 	@echo "遥操作采集流程:"
-	@echo "  1. bash /home/data/Project/Deploy/teleoperate/terminal1.sh"
-	@echo "  2. bash /home/data/Project/Deploy/teleoperate/terminal2.sh"
-	@echo "  3. make teleop TASK='task_name' SAVE_ROOT=/data/dataset"
+	@echo "  make teleop TASK='task_name' SAVE_ROOT=/data/dataset"
+	@echo "  (自动启动 CAN/传感器/FK-IK/采集/键盘)"
 	@echo ""
 
 # ==============================================================================

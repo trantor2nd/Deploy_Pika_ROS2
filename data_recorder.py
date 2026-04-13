@@ -718,6 +718,8 @@ class DataRecorder(Node):
             self._start_recording()
         elif cmd == "stop" and self.recording:
             self._stop_recording()
+        elif cmd == "discard":
+            self._discard_recording()
         elif cmd == "exit":
             if self.recording:
                 self._stop_recording()
@@ -745,6 +747,61 @@ class DataRecorder(Node):
             t = threading.Thread(target=ep.close, daemon=False)
             t.start()
             self._write_threads.append(t)
+
+    def _discard_recording(self) -> None:
+        """丢弃 episode：正在录制则丢弃当前，否则丢弃上一条已完成的。"""
+        if self.recording:
+            # ---- 正在录制，丢弃当前 episode ----
+            self.recording = False
+            ep = self.current_episode
+            self.current_episode = None
+            if ep is None:
+                return
+            ep_idx = ep.episode_index
+            # 释放视频写入器（关闭文件句柄，不调用 finalize_episode）
+            for writer in ep._writers.values():
+                writer.release()
+            # 删除已创建的视频文件
+            for cam in self.writer.active_cameras:
+                vpath = self.writer._video_path(ep_idx, cam)
+                if vpath.exists():
+                    vpath.unlink()
+                    logger.info("已删除视频: %s", vpath)
+            self.get_logger().info(
+                f"Episode {ep_idx} 已丢弃（录制中）"
+            )
+        else:
+            # ---- 未在录制，丢弃上一条已完成的 episode ----
+            if not self.writer.episodes:
+                self.get_logger().warning("没有可丢弃的 episode")
+                return
+            # 等待后台写入线程完成，确保文件已落盘
+            for t in self._write_threads:
+                t.join(timeout=60)
+            self._write_threads.clear()
+            # 取出最后一条 episode
+            last_ep = self.writer.episodes.pop()
+            ep_idx = int(last_ep["episode_index"])
+            n_frames = int(last_ep.get("length", 0))
+            # 更新 writer 状态
+            self.writer.total_frames -= n_frames
+            self.writer.next_episode_index -= 1
+            # 删除 parquet 数据文件
+            dpath = self.writer._data_path(ep_idx)
+            if dpath.exists():
+                dpath.unlink()
+                logger.info("已删除数据: %s", dpath)
+            # 删除视频文件
+            for cam in self.writer.active_cameras:
+                vpath = self.writer._video_path(ep_idx, cam)
+                if vpath.exists():
+                    vpath.unlink()
+                    logger.info("已删除视频: %s", vpath)
+            # 重写 metadata
+            self.writer._write_meta()
+            self.get_logger().info(
+                f"Episode {ep_idx} 已丢弃（已完成, {n_frames} 帧）"
+            )
 
     # ------------------------------------------------------------------ #
     #  采集循环（独立线程，与 ROS 回调并发）
