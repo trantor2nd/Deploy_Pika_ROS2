@@ -22,6 +22,7 @@
 # ===== 可配置参数（命令行覆盖） =====
 CONDA_ENV   ?= py310
 PIPER_WS    ?= /home/data/Project/piper_ros
+PIKA_WS     ?= /home/data/Project/pika_ros
 CAN_PORT    ?= can0
 USB_PORT    ?= /dev/ttyUSB0
 SAVE_ROOT   ?= /home/data/Dataset/piper_lerobot_dataset
@@ -182,9 +183,9 @@ teleop: check-tmux
 	@tmux set-option -t pika_teleop mouse on
 	@# pane 0.0=CAN+sensor  0.1=FK/IK/teleop  0.2=recorder  0.3=keyboard
 	@tmux send-keys -t pika_teleop:0.0 \
-		"cd $(REPO_DIR) && PIPER_WS=$(PIPER_WS) CAN_PORT=$(CAN_PORT) bash teleop_terminal1.sh" Enter
+		"cd $(REPO_DIR) && PIKA_WS=$(PIKA_WS) CAN_PORT=$(CAN_PORT) bash teleop_terminal1.sh" Enter
 	@tmux send-keys -t pika_teleop:0.1 \
-		"sleep 10 && cd $(REPO_DIR) && PIPER_WS=$(PIPER_WS) CONDA_PYTHON=$(CONDA_PYTHON) CONDA_PKGS=$(CONDA_PKGS) bash teleop_terminal2.sh" Enter
+		"sleep 10 && cd $(REPO_DIR) && PIKA_WS=$(PIKA_WS) CONDA_PYTHON=$(CONDA_PYTHON) CONDA_PKGS=$(CONDA_PKGS) bash teleop_terminal2.sh" Enter
 	@tmux send-keys -t pika_teleop:0.2 \
 		"sleep 15 && cd $(REPO_DIR) && $(MAKE) record-teleop SAVE_ROOT='$(SAVE_ROOT)' TASK='$(TASK)' FPS=$(FPS)" Enter
 	@tmux send-keys -t pika_teleop:0.3 \
