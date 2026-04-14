@@ -36,7 +36,8 @@ CONDA_PKGS   := /home/hsb/miniforge3/envs/$(CONDA_ENV)/lib/python3.10/site-packa
 
 # ROS2 环境初始化命令（在 bash -c 中使用）
 ROS_SETUP    := source /opt/ros/humble/setup.bash && \
-                source $(PIPER_WS)/install/setup.bash
+                source $(PIPER_WS)/install/setup.bash && \
+                source $(PIKA_WS)/install/setup.bash
 
 # py310 conda 环境初始化命令
 CONDA_SETUP  := source /home/hsb/miniforge3/etc/profile.d/conda.sh && \
